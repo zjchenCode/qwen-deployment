@@ -21,11 +21,7 @@ A high-performance, production-ready deployment solution for the **Qwen2.5-VL-72
 
 ### One-Command Deployment
 ```bash
-# Download model
-bash download_models.sh
-
-# Start service
-bash start_server.sh
+bash quick_deploy.sh
 ```
 
 ## 📋 System Requirements
