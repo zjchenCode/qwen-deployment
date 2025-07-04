@@ -226,7 +226,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
 from typing import List, Union, Dict, Any, Optional
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 import time
 import uuid
@@ -287,9 +287,13 @@ def load_model():
     
     # Quantization configuration
     if QUANTIZATION == "8bit":
-        model_kwargs["load_in_8bit"] = True
+        from transformers import BitsAndBytesConfig
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            bnb_8bit_compute_dtype=torch.bfloat16,
+            bnb_8bit_use_double_quant=True,
+        )
     elif QUANTIZATION == "4bit":
-        model_kwargs["load_in_4bit"] = True
         from transformers import BitsAndBytesConfig
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -299,7 +303,7 @@ def load_model():
         )
     
     # Load model and processor
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         MODEL_PATH, **model_kwargs
     )
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)

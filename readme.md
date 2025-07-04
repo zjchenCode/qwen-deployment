@@ -1,8 +1,23 @@
-# Qwen2.5-VL-72B API Server Deployment Guide
+# Qwen2.5-VL-72B API Server Deployment
 
-A high-performance Qwen2.5-VL-72B vision-language model API service optimized for large-scale commercial deployment.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?logo=docker&logoColor=white)](https://hub.docker.com/)
 
-## 🚀 Quick Start
+A high-performance, production-ready deployment solution for the **Qwen2.5-VL-72B** vision-language model. Optimized for rental GPU servers like RunPod, Vast.ai, and Lambda Labs with enterprise-grade features.
+
+## 🌟 Features
+
+- 🚀 **One-Click Deployment**: Automated setup with intelligent hardware detection
+- 🔧 **Flexible Quantization**: FP16, 8-bit, 4-bit options for different GPU configurations  
+- 🌐 **OpenAI-Compatible API**: Drop-in replacement for OpenAI's vision models
+- 🐳 **Docker Support**: Full containerization with docker-compose
+- 📊 **Production Ready**: Health checks, monitoring, rate limiting, and logging
+- 💰 **Cost Optimized**: Smart resource allocation for rental servers
+- 🔒 **Secure**: API key authentication and request validation
+
+## 🎯 Quick Start
 
 ### One-Command Deployment
 ```bash

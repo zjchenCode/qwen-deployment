@@ -20,7 +20,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 import uvicorn
 
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
 from qwen_vl_utils import process_vision_info
 
 # Configure logging
@@ -102,7 +103,13 @@ def load_model():
         # Quantization configuration
         if config.LOAD_IN_8BIT:
             logger.info("Loading model with 8-bit quantization")
-            model_kwargs["load_in_8bit"] = True
+            from transformers import BitsAndBytesConfig
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                bnb_8bit_compute_dtype=config.TORCH_DTYPE,
+                bnb_8bit_use_double_quant=True,
+            )
+            model_kwargs["quantization_config"] = quantization_config
         elif config.LOAD_IN_4BIT:
             logger.info("Loading model with 4-bit quantization")
             model_kwargs["load_in_4bit"] = True
@@ -131,7 +138,7 @@ def load_model():
         for key, value in model_kwargs.items():
             logger.info(f"  {key}: {value}")
         
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             config.MODEL_PATH,
             **model_kwargs
         )
@@ -188,8 +195,8 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="Qwen2.5-VL-32B API Server",
-    description="High-performance API for Qwen2.5-VL-32B Vision-Language Model",
+    title="Qwen2.5-VL-72B API Server",
+    description="High-performance API for Qwen2.5-VL-72B Vision-Language Model",
     version="2.0.0",
     lifespan=lifespan,
     docs_url="/docs",
@@ -212,7 +219,7 @@ app.add_middleware(
 
 # Data models
 class ChatMessage(BaseModel):
-    role: str = Field(..., regex="^(user|assistant|system)$")
+    role: str = Field(..., pattern="^(user|assistant|system)$")
     content: Union[str, List[Dict[str, Any]]]
 
 class ChatRequest(BaseModel):
@@ -409,7 +416,7 @@ async def generate_response(messages: List[Dict], max_tokens: int = 2048,
 async def root():
     """Root endpoint"""
     return {
-        "message": "Qwen2.5-VL-32B API Server",
+        "message": "Qwen2.5-VL-72B API Server",
         "status": "running",
         "model": config.MODEL_NAME,
         "capabilities": ["chat", "vision", "multimodal"],
@@ -531,7 +538,7 @@ async def metrics(api_key: str = Depends(verify_api_key)):
     }
 
 if __name__ == "__main__":
-    print("Starting Qwen2.5-VL-32B API Server...")
+    print("Starting Qwen2.5-VL-72B API Server...")
     print(f"API Key: {config.API_KEY}")
     print("Visit http://localhost:8000/docs for API documentation")
     print("This unified endpoint handles both text and vision seamlessly!")
