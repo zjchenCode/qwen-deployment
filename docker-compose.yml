@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  qwen2-5-vl-72b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qwen2.5-vl-72b:latest
+    container_name: qwen2-5-vl-72b-api
+    ports:
+      - "8000:8000"
+    environment:
+      - QWEN_API_KEY=${QWEN_API_KEY:-sk-qwen25-vl-72b--demo-key}
+      - MODEL_PATH=/workspace/Qwen2.5-VL-72B-Instruct
+      - TORCH_DTYPE=bfloat16
+      - DEVICE_MAP=auto
+      - USE_FLASH_ATTENTION=true
+      - LOAD_IN_8BIT=${LOAD_IN_8BIT:-false}
+      - LOAD_IN_4BIT=${LOAD_IN_4BIT:-false}
+      - MAX_MEMORY=${MAX_MEMORY:-}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+    volumes:
+      - ./models:/workspace/models:ro
+      - ./cache:/workspace/.cache
+      - /tmp/offload:/tmp/offload
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  # Optional: Redis for caching
+  redis:
+    image: redis:7-alpine
+    container_name: qwen-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    
+  # Optional: Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: qwen-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - qwen2-5-vl-72b
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    driver: local 
