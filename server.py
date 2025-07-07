@@ -11,7 +11,11 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
+# transformersの詳細ログレベルを設定して警告を抑制
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 import torch
+import gc  # ガベージコレクション用
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,41 +28,129 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 from qwen_vl_utils import process_vision_info
 
-# Configure logging
+# ログ設定
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration class
+# 設定クラス
 class Config:
-    API_KEY = os.getenv("QWEN_API_KEY", "sk-qwen25-vl-72b--demo-key")
+    API_KEY = os.getenv("QWEN_API_KEY", "sk-qwen25-vl-72b--1751619091")
     MODEL_NAME = "qwen/qwen2.5-vl-72b-instruct"
     MODEL_PATH = os.getenv("MODEL_PATH", "/workspace/Qwen2.5-VL-72B-Instruct")
-    MAX_TOKENS_LIMIT = 8192  # Increase token limit
-    MAX_IMAGE_SIZE = 20 * 1024 * 1024  # Increase to 20MB
-    RATE_LIMIT_REQUESTS = 50  # Reduce concurrency limit
-    ALLOWED_HOSTS = ["*"]  # Should be restricted in production
+    MAX_TOKENS_LIMIT = 8192  # トークン制限を増加
+    MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 画像サイズを20MBに増加
+    RATE_LIMIT_REQUESTS = 50  # 同時実行制限を削減
+    ALLOWED_HOSTS = ["*"]  # 本番環境では制限すべき
     
-    # GPU configuration for 72B model
+    # 72Bモデル用GPU設定
     USE_FLASH_ATTENTION = True
     TORCH_DTYPE = torch.bfloat16
-    DEVICE_MAP = "auto"  # Automatic multi-GPU allocation
-    LOAD_IN_8BIT = os.getenv("LOAD_IN_8BIT", "false").lower() == "true"
+    DEVICE_MAP = "auto"  # 自動マルチGPU割り当て
+    LOAD_IN_8BIT = os.getenv("LOAD_IN_8BIT", "true").lower() == "true"
     LOAD_IN_4BIT = os.getenv("LOAD_IN_4BIT", "false").lower() == "true"
-    MAX_MEMORY = os.getenv("MAX_MEMORY", None)  # Can set max memory per GPU
-    OFFLOAD_FOLDER = os.getenv("OFFLOAD_FOLDER", "/tmp/offload")  # CPU offload directory
+    MAX_MEMORY = os.getenv("MAX_MEMORY", None)  # GPU毎の最大メモリ設定可能
+    OFFLOAD_FOLDER = os.getenv("OFFLOAD_FOLDER", "/tmp/offload")  # CPUオフロードディレクトリ
+    
+    # メモリ管理設定
+    AUTO_CLEANUP_MEMORY = os.getenv("AUTO_CLEANUP_MEMORY", "true").lower() == "true"  # 自動メモリクリーンアップ
+    CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "3"))  # クリーンアップ間隔
+    AGGRESSIVE_CLEANUP = os.getenv("AGGRESSIVE_CLEANUP", "true").lower() == "true"  # 積極的クリーンアップ
+    FORCE_SYNC = os.getenv("FORCE_SYNC", "true").lower() == "true"  # GPU同期
+    MAX_MEMORY_THRESHOLD = float(os.getenv("MAX_MEMORY_THRESHOLD", "0.85"))  # メモリ使用率閾値
+    
+    # タイムアウト設定
+    REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "600"))  # 10分のタイムアウト
 
 config = Config()
 
-# Global variables
+# グローバル変数
 model = None
 processor = None
 model_lock = asyncio.Lock()
 
-# Request counter for simple rate limiting
+# シンプルなレート制限用リクエストカウンター
 request_counts = {}
 
+# メモリ管理用カウンター
+inference_count = 0
+last_cleanup_count = 0
+
+def cleanup_gpu_memory(aggressive: bool = False):
+    """GPU メモリをクリーンアップ"""
+    if torch.cuda.is_available():
+        pre_allocated = torch.cuda.memory_allocated() / 1024**3
+        
+        if aggressive:
+            # 完全なメモリクリア
+            torch.cuda.empty_cache()
+            if config.FORCE_SYNC:
+                torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            # すべてのGPUデバイスをクリア
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
+                    if config.FORCE_SYNC:
+                        torch.cuda.synchronize()
+            
+            post_allocated = torch.cuda.memory_allocated() / 1024**3
+            freed = pre_allocated - post_allocated
+            logger.info(f"GPUメモリクリーンアップ完了: {freed:.2f}GB解放")
+        else:
+            # 通常クリーンアップ
+            torch.cuda.empty_cache()
+            gc.collect()
+            if config.FORCE_SYNC:
+                torch.cuda.synchronize()
+            
+            post_allocated = torch.cuda.memory_allocated() / 1024**3
+            freed = pre_allocated - post_allocated
+            logger.debug(f"GPUメモリクリーンアップ完了: {freed:.2f}GB解放")
+
+def get_memory_info():
+    """現在のGPUメモリ使用状況を取得"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        return {
+            "allocated_gb": round(allocated, 2),
+            "reserved_gb": round(reserved, 2),
+            "free_gb": round(reserved - allocated, 2)
+        }
+    return {"allocated_gb": 0, "reserved_gb": 0, "free_gb": 0}
+
+def should_cleanup_memory():
+    """メモリクリーンアップが必要かどうかを判断"""
+    global inference_count, last_cleanup_count
+    
+    if not config.AUTO_CLEANUP_MEMORY:
+        return False
+    
+    # 設定されたインターバル毎にクリーンアップ
+    if inference_count - last_cleanup_count >= config.CLEANUP_INTERVAL:
+        return True
+    
+    # メモリ使用率チェック
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        
+        usage_ratio = allocated / max(reserved, 1)
+        if usage_ratio > config.MAX_MEMORY_THRESHOLD:
+            logger.warning(f"高メモリ使用率検出: {allocated:.2f}GB/{reserved:.2f}GB ({usage_ratio:.1%})")
+            return True
+        
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if allocated > total_memory * 0.8:
+            logger.warning(f"物理メモリ使用量が高い: {allocated:.2f}GB/{total_memory:.2f}GB")
+            return True
+    
+    return False
+
 def load_model():
-    """Load Qwen2.5-VL model and processor"""
+    """Qwen2.5-VLモデルとプロセッサーを読み込み"""
     global model, processor
     
     logger.info("Loading Qwen2.5-VL-72B model...")
@@ -100,24 +192,24 @@ def load_model():
             else:
                 model_kwargs["device_map"] = config.DEVICE_MAP
         
-        # Quantization configuration
+        # 量子化設定（警告を避けるためfloat16を使用）
         if config.LOAD_IN_8BIT:
-            logger.info("Loading model with 8-bit quantization")
+            logger.info("8bit量子化でモデルを読み込み中")
             from transformers import BitsAndBytesConfig
             quantization_config = BitsAndBytesConfig(
                 load_in_8bit=True,
-                bnb_8bit_compute_dtype=config.TORCH_DTYPE,
+                bnb_8bit_compute_dtype=torch.float16,  # 警告を避けるためfloat16を使用
                 bnb_8bit_use_double_quant=True,
             )
             model_kwargs["quantization_config"] = quantization_config
         elif config.LOAD_IN_4BIT:
-            logger.info("Loading model with 4-bit quantization")
+            logger.info("4bit量子化でモデルを読み込み中")
             model_kwargs["load_in_4bit"] = True
-            # 4bit quantization configuration
+            # 4bit量子化設定
             from transformers import BitsAndBytesConfig
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=config.TORCH_DTYPE,
+                bnb_4bit_compute_dtype=torch.float16,  # 警告を避けるためfloat16を使用
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4"
             )
@@ -143,13 +235,43 @@ def load_model():
             **model_kwargs
         )
         
-        # Load processor
+        # プロセッサーを読み込み
         processor = AutoProcessor.from_pretrained(
             config.MODEL_PATH,
             trust_remote_code=True
         )
         
-        # Model warmup
+        # deprecation警告を修正
+        try:
+            import json
+            preprocessor_path = os.path.join(config.MODEL_PATH, "preprocessor.json")
+            video_preprocessor_path = os.path.join(config.MODEL_PATH, "video_preprocessor.json")
+            
+            if os.path.exists(preprocessor_path) and not os.path.exists(video_preprocessor_path):
+                logger.info("video processor設定のdeprecation警告を修正中...")
+                with open(preprocessor_path, 'r') as f:
+                    config_data = json.load(f)
+                
+                # video processor設定を抽出
+                if 'video' in config_data or 'video_processor' in config_data:
+                    video_config = config_data.get('video', config_data.get('video_processor', {}))
+                    with open(video_preprocessor_path, 'w') as f:
+                        json.dump(video_config, f, indent=2)
+                    logger.info("video processor設定をvideo_preprocessor.jsonに保存しました")
+                else:
+                    # デフォルトのvideo processor設定を作成
+                    default_video_config = {
+                        "processor_class": "QwenVideoProcessor",
+                        "video_mean": [0.485, 0.456, 0.406],
+                        "video_std": [0.229, 0.224, 0.225]
+                    }
+                    with open(video_preprocessor_path, 'w') as f:
+                        json.dump(default_video_config, f, indent=2)
+                    logger.info("デフォルトのvideo processor設定を作成しました")
+        except Exception as e:
+            logger.warning(f"deprecation警告の修正に失敗しました: {e}")
+        
+        # モデルの暖機運転
         logger.info("Performing model warmup...")
         try:
             warmup_inputs = processor(
@@ -167,12 +289,19 @@ def load_model():
         
         logger.info("Model loaded successfully!")
         if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
             total_memory = 0
-            for i in range(torch.cuda.device_count()):
+            logger.info("=== GPU Memory Distribution ===")
+            for i in range(gpu_count):
                 memory = torch.cuda.memory_allocated(i) / 1024**3
                 total_memory += memory
-                logger.info(f"GPU {i} memory usage: {memory:.2f} GB")
-            logger.info(f"Total GPU memory usage: {total_memory:.2f} GB")
+                gpu_name = torch.cuda.get_device_name(i)
+                gpu_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                logger.info(f"GPU {i} ({gpu_name}): {memory:.2f}GB / {gpu_total:.1f}GB used")
+            logger.info(f"Total GPU memory usage: {total_memory:.2f} GB across {gpu_count} GPU(s)")
+            
+            if gpu_count > 1:
+                logger.info("Multi-GPU configuration detected - model distributed automatically")
             
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
@@ -226,7 +355,7 @@ class ChatRequest(BaseModel):
     model: str
     messages: List[ChatMessage] = Field(..., min_items=1)
     max_tokens: Optional[int] = Field(default=2048, ge=1, le=config.MAX_TOKENS_LIMIT)
-    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
+    temperature: Optional[float] = Field(default=0.0, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=0.9, ge=0.0, le=1.0)
     stream: Optional[bool] = False
 
@@ -302,7 +431,7 @@ def validate_image_format(image_data: bytes) -> bool:
         return False
 
 def process_content(content) -> List[Dict]:
-    """Process message content to handle text and images"""
+    """メッセージ内容を処理してテキストと画像を扱う"""
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     
@@ -314,17 +443,17 @@ def process_content(content) -> List[Dict]:
             image_url = item["image_url"]["url"]
             if image_url.startswith("data:image"):
                 try:
-                    # Parse base64 image
+                    # base64画像を解析
                     header, image_data = image_url.split(",", 1)
                     image_bytes = base64.b64decode(image_data)
                     
-                    # Check image size
+                    # 画像サイズをチェック
                     if len(image_bytes) > config.MAX_IMAGE_SIZE:
-                        raise HTTPException(status_code=400, detail="Image size exceeds limit")
+                        raise HTTPException(status_code=400, detail="画像サイズが制限を超えています")
                     
-                    # Validate image format
+                    # 画像フォーマットを検証
                     if not validate_image_format(image_bytes):
-                        raise HTTPException(status_code=400, detail="Unsupported image format")
+                        raise HTTPException(status_code=400, detail="サポートされていない画像フォーマットです")
                     
                     image = Image.open(io.BytesIO(image_bytes))
                     if image.mode != 'RGB':
@@ -332,23 +461,27 @@ def process_content(content) -> List[Dict]:
                     
                     processed.append({"type": "image", "image": image})
                 except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Image processing error: {str(e)}")
+                    raise HTTPException(status_code=400, detail=f"画像処理エラー: {str(e)}")
             else:
-                raise HTTPException(status_code=400, detail="Only base64 image format is supported")
+                raise HTTPException(status_code=400, detail="base64画像フォーマットのみサポートされています")
     
     return processed
 
 async def generate_response(messages: List[Dict], max_tokens: int = 2048, 
-                          temperature: float = 0.7, top_p: float = 0.9) -> str:
-    """Generate model response using the unified VL model"""
+                          temperature: float = 0.0, top_p: float = 0.9) -> str:
+    """統合VLモデルを使用してモデル応答を生成"""
     global model, processor
     
     if model is None or processor is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+        raise HTTPException(status_code=503, detail="モデルが読み込まれていません")
     
-    async with model_lock:  # Prevent concurrent inference issues
+    # 推論前のメモリ状態をログ記録
+    pre_memory = get_memory_info()
+    logger.debug(f"推論開始 - メモリ使用量: {pre_memory['allocated_gb']}GB/{pre_memory['reserved_gb']}GB")
+    
+    async with model_lock:  # 同時推論の問題を防ぐ
         try:
-            # Process messages for multimodal input
+            # マルチモーダル入力用のメッセージを処理
             processed_messages = []
             for msg in messages:
                 processed_messages.append({
@@ -378,34 +511,69 @@ async def generate_response(messages: List[Dict], max_tokens: int = 2048,
             if torch.cuda.is_available():
                 inputs = inputs.to("cuda")
             
-            # Generate response using the same model for all modalities
+            # 生成パラメータを準備（警告を避けるため）
+            generation_kwargs = {
+                "max_new_tokens": max_tokens,
+                "pad_token_id": processor.tokenizer.eos_token_id,
+                "eos_token_id": processor.tokenizer.eos_token_id,
+            }
+            
+            # temperatureとsampling設定（サポートされている場合のみ）
+            if temperature > 0:
+                generation_kwargs.update({
+                    "do_sample": True,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                })
+            else:
+                generation_kwargs["do_sample"] = False
+            
+            # 同一モデルを使用してすべてのモダリティの応答を生成
             with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    do_sample=temperature > 0,
-                    pad_token_id=processor.tokenizer.eos_token_id,
-                    eos_token_id=processor.tokenizer.eos_token_id,
-                )
+                generated_ids = model.generate(**inputs, **generation_kwargs)
             
             # Extract newly generated tokens
             generated_ids_trimmed = [
                 out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
             ]
             
-            # Decode response
+            # レスポンスをデコード
             output_text = processor.batch_decode(
                 generated_ids_trimmed,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False
             )[0]
             
+            # 推理完了後のメモリ管理
+            global inference_count, last_cleanup_count
+            inference_count += 1
+            
+            # 明示的に中間変数を削除
+            del inputs, generated_ids, generated_ids_trimmed
+            
+            # 基本的なクリーンアップを実行
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # 条件に応じてクリーンアップを実行
+            if should_cleanup_memory():
+                cleanup_gpu_memory(aggressive=config.AGGRESSIVE_CLEANUP)
+                last_cleanup_count = inference_count
+                logger.info(f"メモリクリーンアップ実行 (推理回数: {inference_count})")
+            elif config.FORCE_SYNC:
+                torch.cuda.synchronize()
+                logger.debug(f"軽量クリーンアップ実行 (推理回数: {inference_count})")
+            
+            # 推論後のメモリ状態をログ記録
+            post_memory = get_memory_info()
+            memory_delta = pre_memory['allocated_gb'] - post_memory['allocated_gb']
+            logger.debug(f"推論完了 - メモリ変化: {memory_delta:+.2f}GB, 現在使用量: {post_memory['allocated_gb']}GB")
+            
             return output_text.strip()
             
         except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+            # OOMエラー時は積極的クリーンアップを実行
+            cleanup_gpu_memory(aggressive=True)
             raise HTTPException(status_code=503, detail="GPU out of memory, please try again later")
         except Exception as e:
             logger.error(f"Generation failed: {e}")
@@ -499,14 +667,16 @@ async def chat_completions(
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
+    """ヘルスチェックエンドポイント"""
     gpu_info = {}
     if torch.cuda.is_available():
+        memory_info = get_memory_info()
         gpu_info = {
             "gpu_available": True,
             "gpu_count": torch.cuda.device_count(),
-            "gpu_memory_allocated": f"{torch.cuda.memory_allocated() / 1024**3:.2f} GB",
-            "gpu_memory_reserved": f"{torch.cuda.memory_reserved() / 1024**3:.2f} GB",
+            "gpu_memory_allocated": f"{memory_info['allocated_gb']} GB",
+            "gpu_memory_reserved": f"{memory_info['reserved_gb']} GB",
+            "gpu_memory_free": f"{memory_info['free_gb']} GB",
             "gpu_utilization": f"{torch.cuda.utilization()}%" if hasattr(torch.cuda, 'utilization') else "N/A"
         }
     else:
@@ -519,27 +689,73 @@ async def health():
         "model_type": "vision_language_model",
         "timestamp": datetime.now().isoformat(),
         "uptime_seconds": time.time(),
+        "inference_count": inference_count,
+        "memory_management": {
+            "auto_cleanup": config.AUTO_CLEANUP_MEMORY,
+            "cleanup_interval": config.CLEANUP_INTERVAL,
+            "aggressive_cleanup": config.AGGRESSIVE_CLEANUP,
+            "last_cleanup_at": last_cleanup_count
+        },
         **gpu_info
     }
 
 @app.get("/metrics")
 async def metrics(api_key: str = Depends(verify_api_key)):
-    """Monitoring metrics endpoint"""
+    """監視メトリクスエンドポイント"""
+    memory_info = get_memory_info() if torch.cuda.is_available() else {}
+    
     return {
         "active_requests": len(request_counts),
         "model_loaded": model is not None,
         "model_type": "unified_vision_language",
         "gpu_available": torch.cuda.is_available(),
+        "inference_stats": {
+            "total_inferences": inference_count,
+            "cleanups_performed": last_cleanup_count,
+            "pending_cleanups": max(0, inference_count - last_cleanup_count)
+        },
         "memory_usage": {
-            "gpu_allocated_gb": torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0,
-            "gpu_reserved_gb": torch.cuda.memory_reserved() / 1024**3 if torch.cuda.is_available() else 0
+            "gpu_allocated_gb": memory_info.get("allocated_gb", 0),
+            "gpu_reserved_gb": memory_info.get("reserved_gb", 0),
+            "gpu_free_gb": memory_info.get("free_gb", 0)
+        },
+        "memory_config": {
+            "auto_cleanup_enabled": config.AUTO_CLEANUP_MEMORY,
+            "cleanup_interval": config.CLEANUP_INTERVAL,
+            "aggressive_cleanup": config.AGGRESSIVE_CLEANUP
         },
         "capabilities": ["text", "image", "multimodal_chat"]
     }
 
+@app.post("/v1/memory/cleanup")
+async def manual_memory_cleanup(api_key: str = Depends(verify_api_key)):
+    """手動でGPUメモリクリーンアップを実行"""
+    try:
+        memory_before = get_memory_info()
+        cleanup_gpu_memory(aggressive=True)
+        memory_after = get_memory_info()
+        
+        global last_cleanup_count
+        last_cleanup_count = inference_count
+        
+        return {
+            "status": "success",
+            "message": "手動メモリクリーンアップが完了しました",
+            "memory_before": memory_before,
+            "memory_after": memory_after,
+            "freed_gb": round(memory_before.get("allocated_gb", 0) - memory_after.get("allocated_gb", 0), 2)
+        }
+    except Exception as e:
+        logger.error(f"Manual cleanup failed: {e}")
+        return {
+            "status": "error",
+            "message": f"メモリクリーンアップに失敗しました: {str(e)}"
+        }
+
 if __name__ == "__main__":
     print("Starting Qwen2.5-VL-72B API Server...")
     print(f"API Key: {config.API_KEY}")
+    print(f"Request Timeout: {config.REQUEST_TIMEOUT}秒")
     print("Visit http://localhost:8000/docs for API documentation")
     print("This unified endpoint handles both text and vision seamlessly!")
     
@@ -548,5 +764,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         access_log=True,
-        log_level="info"
+        log_level="info",
+        timeout_keep_alive=config.REQUEST_TIMEOUT,
+        timeout_graceful_shutdown=30
     )

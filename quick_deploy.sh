@@ -101,6 +101,32 @@ configure_deployment() {
     read -p "Please set API port (default: $DEFAULT_PORT): " PORT
     PORT=${PORT:-$DEFAULT_PORT}
     
+    # Multi-GPU configuration
+    echo ""
+    echo "GPU Configuration options:"
+    echo "1) Single GPU (auto detection)"
+    echo "2) Multi-GPU with auto distribution [Recommended for 2×H100]"
+    echo "3) Multi-GPU with manual memory allocation"
+    echo ""
+    read -p "Please choose GPU configuration [1-3] (default: 1): " gpu_choice
+    
+    case $gpu_choice in
+        2) 
+            GPU_CONFIG="multi_auto"
+            print_info "Multi-GPU auto distribution selected"
+            ;;
+        3) 
+            GPU_CONFIG="multi_manual"
+            read -p "Enter memory allocation (e.g., '75GiB,75GiB' for 2×H100): " MANUAL_MEMORY
+            MANUAL_MEMORY=${MANUAL_MEMORY:-"75GiB,75GiB"}
+            print_info "Manual memory allocation: $MANUAL_MEMORY"
+            ;;
+        *) 
+            GPU_CONFIG="single"
+            print_info "Single GPU configuration selected"
+            ;;
+    esac
+    
     # Quantization options
     echo ""
     echo "Quantization options:"
@@ -121,6 +147,10 @@ configure_deployment() {
     print_info "Deployment configuration confirmation:"
     echo "  API Key: ${API_KEY:0:20}..."
     echo "  Port: $PORT"
+    echo "  GPU Config: $GPU_CONFIG"
+    if [ "$GPU_CONFIG" = "multi_manual" ]; then
+        echo "  Memory Allocation: $MANUAL_MEMORY"
+    fi
     echo "  Quantization: $QUANTIZATION"
     echo ""
     
@@ -223,15 +253,22 @@ import os
 import torch
 import logging
 import uvicorn
+import base64
+import io
+import gc  # ガベージコレクション用
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
 from typing import List, Union, Dict, Any, Optional
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
+from PIL import Image
 import time
 import uuid
 
-# Logging configuration
+# transformersの詳細ログレベルを設定して警告を抑制
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+# ログ設定
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -240,9 +277,21 @@ MODEL_PATH = os.getenv("MODEL_PATH", "/workspace/Qwen2.5-VL-72B-Instruct")
 API_KEY = os.getenv("QWEN_API_KEY", "your-api-key")
 QUANTIZATION = os.getenv("QUANTIZATION", "8bit")
 
-# Global variables
+# グローバル変数
 model = None
 processor = None
+
+# メモリ管理用カウンター
+inference_count = 0
+last_cleanup_count = 0
+
+# メモリ管理設定
+AUTO_CLEANUP_MEMORY = os.getenv("AUTO_CLEANUP_MEMORY", "true").lower() == "true"
+CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "3"))
+AGGRESSIVE_CLEANUP = os.getenv("AGGRESSIVE_CLEANUP", "true").lower() == "true"
+FORCE_SYNC = os.getenv("FORCE_SYNC", "true").lower() == "true"
+MAX_MEMORY_THRESHOLD = float(os.getenv("MAX_MEMORY_THRESHOLD", "0.85"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "600"))
 
 class ChatMessage(BaseModel):
     role: str
@@ -271,7 +320,89 @@ def verify_api_key(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return token
 
-# Load model
+# Content processing function
+def process_content(content) -> List[Dict]:
+    """Process message content to handle text and images"""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    
+    processed = []
+    for item in content:
+        if item["type"] == "text":
+            processed.append({"type": "text", "text": item["text"]})
+        elif item["type"] == "image_url":
+            image_url = item["image_url"]["url"]
+            if image_url.startswith("data:image"):
+                try:
+                    # Parse base64 image
+                    header, image_data = image_url.split(",", 1)
+                    image_bytes = base64.b64decode(image_data)
+                    
+                    # Convert to PIL Image
+                    image = Image.open(io.BytesIO(image_bytes))
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                    
+                    processed.append({"type": "image", "image": image})
+                except Exception as e:
+                    logger.error(f"Image processing error: {e}")
+                    raise HTTPException(status_code=400, detail=f"Image processing error: {str(e)}")
+            else:
+                raise HTTPException(status_code=400, detail="Only base64 image format is supported")
+    
+    return processed
+
+def cleanup_gpu_memory(aggressive: bool = False):
+    """GPU メモリをクリーンアップ"""
+    if torch.cuda.is_available():
+        if aggressive:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            logger.info("積極的GPUメモリクリーンアップを実行")
+        else:
+            torch.cuda.empty_cache()
+            logger.debug("GPUメモリキャッシュクリーンアップを実行")
+
+def get_memory_info():
+    """現在のGPUメモリ使用状況を取得"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        return {
+            "allocated_gb": round(allocated, 2),
+            "reserved_gb": round(reserved, 2),
+            "free_gb": round(reserved - allocated, 2)
+        }
+    return {"allocated_gb": 0, "reserved_gb": 0, "free_gb": 0}
+
+def should_cleanup_memory():
+    """メモリクリーンアップが必要かどうかを判断"""
+    global inference_count, last_cleanup_count
+    
+    if not AUTO_CLEANUP_MEMORY:
+        return False
+    
+    if inference_count - last_cleanup_count >= CLEANUP_INTERVAL:
+        return True
+    
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        
+        usage_ratio = allocated / max(reserved, 1)
+        if usage_ratio > MAX_MEMORY_THRESHOLD:
+            logger.warning(f"高メモリ使用率検出: {allocated:.2f}GB/{reserved:.2f}GB ({usage_ratio:.1%})")
+            return True
+        
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if allocated > total_memory * 0.8:
+            logger.warning(f"物理メモリ使用量が高い: {allocated:.2f}GB/{total_memory:.2f}GB")
+            return True
+    
+    return False
+
+# モデル読み込み
 def load_model():
     global model, processor
     
@@ -285,19 +416,19 @@ def load_model():
         "trust_remote_code": True,
     }
     
-    # Quantization configuration
+    # 量子化設定（警告を避けるためfloat16を使用）
     if QUANTIZATION == "8bit":
         from transformers import BitsAndBytesConfig
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.bfloat16,
+            bnb_8bit_compute_dtype=torch.float16,  # 警告を避けるためfloat16を使用
             bnb_8bit_use_double_quant=True,
         )
     elif QUANTIZATION == "4bit":
         from transformers import BitsAndBytesConfig
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=torch.float16,  # 警告を避けるためfloat16を使用
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4"
         )
@@ -307,6 +438,26 @@ def load_model():
         MODEL_PATH, **model_kwargs
     )
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    
+    # Fix deprecation warning by resaving processor config
+    try:
+        import json
+        preprocessor_path = os.path.join(MODEL_PATH, "preprocessor.json")
+        video_preprocessor_path = os.path.join(MODEL_PATH, "video_preprocessor.json")
+        
+        if os.path.exists(preprocessor_path) and not os.path.exists(video_preprocessor_path):
+            logger.info("Fixing video processor config deprecation warning...")
+            with open(preprocessor_path, 'r') as f:
+                config = json.load(f)
+            
+            # Extract video processor config if it exists
+            if 'video' in config or 'video_processor' in config:
+                video_config = config.get('video', config.get('video_processor', {}))
+                with open(video_preprocessor_path, 'w') as f:
+                    json.dump(video_config, f, indent=2)
+                logger.info("Video processor config saved to video_preprocessor.json")
+    except Exception as e:
+        logger.warning(f"Could not fix deprecation warning: {e}")
     
     logger.info("Model loaded successfully!")
 
@@ -323,10 +474,19 @@ async def root():
 
 @app.get("/health")
 async def health():
+    memory_info = get_memory_info()
     return {
         "status": "healthy" if model is not None else "loading",
         "model_loaded": model is not None,
-        "quantization": QUANTIZATION
+        "quantization": QUANTIZATION,
+        "inference_count": inference_count,
+        "memory_management": {
+            "auto_cleanup": AUTO_CLEANUP_MEMORY,
+            "cleanup_interval": CLEANUP_INTERVAL,
+            "aggressive_cleanup": AGGRESSIVE_CLEANUP,
+            "last_cleanup_at": last_cleanup_count
+        },
+        "gpu_memory": memory_info
     }
 
 @app.post("/v1/chat/completions", response_model=ChatResponse)
@@ -335,14 +495,19 @@ async def chat_completions(request: ChatRequest, api_key: str = Depends(verify_a
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
-        # Process messages
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        # Process messages with correct content formatting
+        processed_messages = []
+        for msg in request.messages:
+            processed_messages.append({
+                "role": msg.role,
+                "content": process_content(msg.content)
+            })
         
         # Apply chat template
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = processor.apply_chat_template(processed_messages, tokenize=False, add_generation_prompt=True)
         
         # Process vision information
-        image_inputs, video_inputs = process_vision_info(messages)
+        image_inputs, video_inputs = process_vision_info(processed_messages)
         
         # Prepare inputs
         inputs = processor(
@@ -353,22 +518,51 @@ async def chat_completions(request: ChatRequest, api_key: str = Depends(verify_a
             return_tensors="pt"
         ).to(model.device)
         
-        # Generate response
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=request.max_tokens,
-                temperature=request.temperature,
-                do_sample=request.temperature > 0,
-            )
+        # 生成パラメータを準備（警告を避けるため）
+        generation_kwargs = {
+            "max_new_tokens": request.max_tokens,
+        }
         
-        # Decode response
+        # temperatureとsampling設定（サポートされている場合のみ）
+        if request.temperature > 0:
+            generation_kwargs.update({
+                "do_sample": True,
+                "temperature": request.temperature,
+            })
+        else:
+            generation_kwargs["do_sample"] = False
+        
+        # 応答を生成
+        with torch.no_grad():
+            generated_ids = model.generate(**inputs, **generation_kwargs)
+        
+        # レスポンスをデコード
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
         response_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
         
-        # Build response
+        # 推理完了後のメモリ管理
+        global inference_count, last_cleanup_count
+        inference_count += 1
+        
+        # 明示的に中間変数を削除
+        del inputs, generated_ids, generated_ids_trimmed
+        
+        # 基本的なクリーンアップを実行
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # 条件に応じてクリーンアップを実行
+        if should_cleanup_memory():
+            cleanup_gpu_memory(aggressive=AGGRESSIVE_CLEANUP)
+            last_cleanup_count = inference_count
+            logger.info(f"メモリクリーンアップ実行 (推理回数: {inference_count})")
+        elif FORCE_SYNC:
+            torch.cuda.synchronize()
+            logger.debug(f"軽量クリーンアップ実行 (推理回数: {inference_count})")
+        
+        # レスポンスを構築
         return ChatResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
             created=int(time.time()),
@@ -390,7 +584,13 @@ async def chat_completions(request: ChatRequest, api_key: str = Depends(verify_a
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=int(os.getenv("PORT", 8000)),
+        timeout_keep_alive=REQUEST_TIMEOUT,
+        timeout_graceful_shutdown=30
+    )
 EOF
 }
 
@@ -401,21 +601,69 @@ create_startup_script() {
     cat > start_qwen.sh << EOF
 #!/bin/bash
 
-# Set environment variables
+# 環境変数を設定
 export MODEL_PATH="$WORKSPACE_DIR/Qwen2.5-VL-72B-Instruct"
 export QWEN_API_KEY="$API_KEY"
 export QUANTIZATION="$QUANTIZATION"
 export PORT="$PORT"
 
-# PyTorch optimizations
+# GPU設定を適用
+case "$GPU_CONFIG" in
+    "multi_auto")
+        export DEVICE_MAP="auto"
+        echo "🔧 多GPU自動分散モード有効"
+        ;;
+    "multi_manual")
+        export DEVICE_MAP="auto"
+        export MAX_MEMORY="$MANUAL_MEMORY"
+        echo "🔧 多GPU手動メモリ分割: $MANUAL_MEMORY"
+        ;;
+    *)
+        export DEVICE_MAP="auto"
+        echo "🔧 単一GPU自動検出モード"
+        ;;
+esac
+
+# PyTorch最適化とログ抑制設定
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
 export OMP_NUM_THREADS="8"
 export TOKENIZERS_PARALLELISM="false"
+export TRANSFORMERS_VERBOSITY="error"  # 警告を抑制
 
-echo "🚀 Starting Qwen2.5-VL-72B API Server..."
-echo "Port: $PORT"
-echo "Quantization: $QUANTIZATION"
+# メモリ管理設定
+export AUTO_CLEANUP_MEMORY="true"   # 自動メモリクリーンアップを有効
+export CLEANUP_INTERVAL="3"         # 3回の推理毎にクリーンアップ
+export AGGRESSIVE_CLEANUP="true"    # 積極的クリーンアップを有効
+export FORCE_SYNC="true"             # GPU同期を有効
+export MAX_MEMORY_THRESHOLD="0.85"  # メモリ使用率85%でクリーンアップ
+
+# タイムアウト設定
+export REQUEST_TIMEOUT="600"        # 10分のリクエストタイムアウト
+
+echo "🚀 Qwen2.5-VL-72B APIサーバーを起動中..."
+echo "ポート: $PORT"
+echo "量子化: $QUANTIZATION"
 echo "API Key: ${API_KEY:0:20}..."
+
+# GPU設定表示
+case "$GPU_CONFIG" in
+    "multi_auto")
+        echo "🎯 GPU設定: 多GPU自動分散"
+        ;;
+    "multi_manual") 
+        echo "🎯 GPU設定: 多GPU手動分割 ($MANUAL_MEMORY)"
+        ;;
+    *)
+        echo "🎯 GPU設定: 単一GPU"
+        ;;
+esac
+
+echo "🔧 警告修正: Temperature, BitsAndBytes, Deprecation"
+echo "🧠 メモリ管理有効:"
+echo "  - クリーンアップ間隔: ${CLEANUP_INTERVAL}回"
+echo "  - 強制同期: 有効"
+echo "  - メモリ閾値: ${MAX_MEMORY_THRESHOLD}"
+echo "⏱️  タイムアウト: ${REQUEST_TIMEOUT}秒"
 
 cd $WORKSPACE_DIR
 python3 qwen_server.py
@@ -434,26 +682,37 @@ create_test_script() {
 API_KEY="$API_KEY"
 PORT="$PORT"
 
-echo "🧪 Testing API server..."
+echo "🧪 APIサーバーをテスト中..."
 
-# Health check
-echo "1. Health check..."
+# ヘルスチェック
+echo "1. ヘルスチェック..."
 curl -s http://localhost:$PORT/health | jq .
 
-echo -e "\n2. Text conversation test..."
+echo -e "\n2. テキスト会話テスト..."
 curl -X POST http://localhost:$PORT/v1/chat/completions \\
   -H "Authorization: Bearer \$API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
     "model": "qwen/qwen2.5-vl-72b-instruct",
     "messages": [
-      {"role": "user", "content": "Hello, please introduce yourself briefly."}
+      {"role": "user", "content": "こんにちは、簡単に自己紹介してください。"}
     ],
     "max_tokens": 512
   }' | jq .
 
-echo -e "\n✅ Test completed!"
-echo "API Documentation: http://localhost:$PORT/docs"
+echo -e "\n3. メモリ管理テスト..."
+curl -s http://localhost:$PORT/health | jq '.memory_management, .gpu_memory'
+
+echo -e "\n✅ テスト完了!"
+echo "APIドキュメント: http://localhost:$PORT/docs"
+echo "🔧 修正済み問題:"
+echo "  - メッセージ処理エラーの修正"
+echo "  - Deprecation警告の修正"
+echo "  - GPU メモリ管理の改善"
+echo ""
+echo "💡 メモリ管理:"
+echo "  - 手動クリーンアップ: POST /v1/memory/cleanup"
+echo "  - メモリ監視: GET /health または /metrics"
 EOF
 
     chmod +x test_api.sh
@@ -465,21 +724,40 @@ start_service() {
     
     cd $WORKSPACE_DIR
     
-    print_success "🎉 Deployment completed!"
+    print_success "🎉 デプロイメント完了！"
     echo ""
     echo "==============================================="
-    echo "📋 Deployment Information"
+    echo "📋 デプロイメント情報"
     echo "==============================================="
-    echo "API Address: http://localhost:$PORT"
-    echo "API Key: $API_KEY"
-    echo "Quantization Mode: $QUANTIZATION"
-    echo "Model Path: $WORKSPACE_DIR/Qwen2.5-VL-72B-Instruct"
+    echo "API アドレス: http://localhost:$PORT"
+    echo "API キー: $API_KEY"
+    echo "量子化モード: $QUANTIZATION"
+    case "$GPU_CONFIG" in
+        "multi_auto")
+            echo "GPU設定: 多GPU自動分散"
+            ;;
+        "multi_manual") 
+            echo "GPU設定: 多GPU手動分割 ($MANUAL_MEMORY)"
+            ;;
+        *)
+            echo "GPU設定: 単一GPU"
+            ;;
+    esac
+    echo "モデルパス: $WORKSPACE_DIR/Qwen2.5-VL-72B-Instruct"
     echo ""
     echo "==============================================="
-    echo "🚀 Startup Commands"
+    echo "🚀 起動コマンド"
     echo "==============================================="
-    echo "Start service: ./start_qwen.sh"
-    echo "Test API: ./test_api.sh"
+    echo "サービス開始: ./start_qwen.sh"
+    echo "API テスト: ./test_api.sh"
+    echo ""
+    echo "🔧 問題が修正されました:"
+    echo "  - メッセージ処理エラー ('dict' object has no attribute 'startswith')"
+    echo "  - preprocessor.json deprecation警告"
+    echo "  - 10分タイムアウト設定追加"
+    if [ "$GPU_CONFIG" != "single" ]; then
+        echo "  - 多GPU自動分散対応"
+    fi
     echo ""
     
     read -p "Start service now? [y/N]: " start_now
